@@ -1,11 +1,18 @@
 package com.haotian.sdv2v
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.media.MediaMetadataRetriever
 import android.net.Uri
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.jcodec.api.android.AndroidFrameGrab
+import org.jcodec.api.android.AndroidSequenceEncoder
+import org.jcodec.common.io.NIOUtils
 import java.io.File
 import java.util.Locale
 
@@ -40,51 +47,110 @@ class VideoProcessor(private val engine: SdEngine) {
             inputVideo.outputStream().use { out -> input.copyTo(out) }
         } ?: error("无法读取输入视频")
 
-        onProgress(0.2f, "开始风格化处理...")
+        val durationSec = readDurationSec(context, videoUri)
+        onProgress(0.15f, "开始逐帧处理...")
 
-        val vf = buildFilter(config)
-        val cmdPrimary = "-y -i \"${inputVideo.absolutePath}\" -vf \"$vf\" -c:v libx264 -preset veryfast -crf 23 -c:a copy \"${outputVideo.absolutePath}\""
+        val channel = NIOUtils.readableChannel(inputVideo)
+        var encoder: AndroidSequenceEncoder? = null
+        var frameCount = 0
 
-        val sessionPrimary = FFmpegKit.execute(cmdPrimary)
-        if (!ReturnCode.isSuccess(sessionPrimary.returnCode)) {
-            // 兜底编码器，避免个别机型缺失 x264 编码
-            onProgress(0.7f, "主编码失败，切换兼容模式...")
-            val cmdFallback = "-y -i \"${inputVideo.absolutePath}\" -vf \"$vf\" -c:v mpeg4 -q:v 4 -c:a aac -b:a 128k \"${outputVideo.absolutePath}\""
-            val sessionFallback = FFmpegKit.execute(cmdFallback)
-            if (!ReturnCode.isSuccess(sessionFallback.returnCode)) {
-                val failLog = sessionFallback.failStackTrace ?: sessionFallback.logsAsString
-                error("视频处理失败: $failLog")
+        try {
+            val grab = AndroidFrameGrab.createAndroidFrameGrab(channel)
+            encoder = AndroidSequenceEncoder.createSequenceEncoder(outputVideo, config.fps)
+
+            while (true) {
+                val frameMeta = grab.getFrameWithMetadata() ?: break
+                val inBmp = frameMeta.bitmap ?: break
+                val outBmp = stylizeBitmap(inBmp, config)
+                encoder.encodeImage(outBmp)
+                if (outBmp !== inBmp && !outBmp.isRecycled) outBmp.recycle()
+
+                frameCount++
+                val ts = frameMeta.timestamp
+                val inner = when {
+                    durationSec > 0.0 -> (ts / durationSec).toFloat().coerceIn(0f, 1f)
+                    else -> (frameCount / 240f).coerceAtMost(1f)
+                }
+                onProgress(0.15f + inner * 0.8f, "处理中：$frameCount 帧")
             }
+        } finally {
+            runCatching { encoder?.finish() }
+            NIOUtils.closeQuietly(channel)
         }
+
+        if (frameCount == 0) error("未解码到有效视频帧")
 
         onProgress(1f, "完成")
         outputVideo.absolutePath
     }
 
-    private fun buildFilter(config: VideoJobConfig): String {
-        val saturation = 1.0 + config.strength.coerceIn(0f, 1f) * 0.8
-        val contrast = 1.0 + config.strength.coerceIn(0f, 1f) * 0.35
-        val brightness = (config.strength.coerceIn(0f, 1f) - 0.5) * 0.06
+    private fun readDurationSec(context: Context, uri: Uri): Double {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(context, uri)
+            val ms = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toDoubleOrNull() ?: 0.0
+            ms / 1000.0
+        } catch (_: Exception) {
+            0.0
+        } finally {
+            runCatching { mmr.release() }
+        }
+    }
 
-        val base = String.format(
-            Locale.US,
-            "fps=%d,scale=-2:%d,eq=saturation=%.3f:contrast=%.3f:brightness=%.3f,unsharp=5:5:0.70:3:3:0.30",
-            config.fps,
-            config.targetHeight,
-            saturation,
-            contrast,
-            brightness
-        )
-
+    private fun stylizeBitmap(input: Bitmap, config: VideoJobConfig): Bitmap {
         val p = config.prompt.lowercase(Locale.getDefault())
-        val style = when {
-            "anime" in p || "cartoon" in p || "二次元" in p -> ",hue=s=1.25"
-            "black and white" in p || "bw" in p || "黑白" in p -> ",hue=s=0"
-            "warm" in p || "暖色" in p -> ",colorbalance=rs=.08:gs=.03:bs=-.03"
-            "cold" in p || "cool" in p || "冷色" in p -> ",colorbalance=rs=-.03:gs=.00:bs=.08"
-            else -> ""
+        val strength = config.strength.coerceIn(0f, 1f)
+
+        val saturation = when {
+            "black and white" in p || "bw" in p || "黑白" in p -> 0f
+            else -> 1f + 0.8f * strength
+        }
+        val contrast = 1f + 0.35f * strength
+        val brightness = (strength - 0.5f) * 0.08f
+
+        val color = ColorMatrix().apply { setSaturation(saturation) }
+
+        val t = ((-0.5f * contrast + 0.5f) + brightness) * 255f
+        val contrastMatrix = ColorMatrix(
+            floatArrayOf(
+                contrast, 0f, 0f, 0f, t,
+                0f, contrast, 0f, 0f, t,
+                0f, 0f, contrast, 0f, t,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+        color.postConcat(contrastMatrix)
+
+        if ("warm" in p || "暖色" in p) {
+            color.postConcat(
+                ColorMatrix(
+                    floatArrayOf(
+                        1.07f, 0f, 0f, 0f, 8f,
+                        0f, 1.02f, 0f, 0f, 2f,
+                        0f, 0f, 0.94f, 0f, -6f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+            )
+        } else if ("cool" in p || "cold" in p || "冷色" in p) {
+            color.postConcat(
+                ColorMatrix(
+                    floatArrayOf(
+                        0.95f, 0f, 0f, 0f, -6f,
+                        0f, 1.00f, 0f, 0f, 0f,
+                        0f, 0f, 1.08f, 0f, 9f,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+            )
         }
 
-        return base + style
+        val out = Bitmap.createBitmap(input.width, input.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(color)
+        }
+        canvas.drawBitmap(input, 0f, 0f, paint)
+        return out
     }
 }
