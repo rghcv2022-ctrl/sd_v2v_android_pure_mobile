@@ -11,12 +11,15 @@ android {
         applicationId = "com.haotian.sdv2v"
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+        ndk {
+            abiFilters += listOf("arm64-v8a")
         }
     }
 
@@ -65,7 +68,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.18.0")
+    implementation("com.arthenica:ffmpeg-kit-min-gpl:6.0-2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
